@@ -70,6 +70,11 @@ export const DESKTOP_AGENT_SETUP_TARGETS: readonly DesktopAgentSetupTarget[] = [
 	{
 		id: "codex",
 		setupActions: ["codex-hooks-json", "codex-wrapper"],
+		// Windows: hooks live in ~/.codex/hooks.json (the bash wrapper is skipped —
+		// Codex inherits SUPERSET_* env from the terminal). createCodexHooksJson
+		// writes a codex-notify.cmd launcher that forwards Codex's argv JSON to
+		// notify.sh via Git Bash.
+		windowsSetupActions: ["codex-hooks-json"],
 		managedBinary: true,
 	},
 	{

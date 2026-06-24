@@ -363,12 +363,63 @@ export function buildCodexWrapperExecLine(notifyPath: string): string {
 	return template.replaceAll("{{NOTIFY_PATH}}", notifyPath);
 }
 
+/**
+ * Windows: the Codex .cmd launcher. Codex passes the hook JSON as argv (unlike
+ * Claude's stdin), so the launcher forwards %* to notify.sh via Git Bash.
+ */
+const CODEX_WIN32_LAUNCHER_NAME = "codex-notify.cmd";
+function getCodexWin32LauncherPath(): string {
+	return path.join(HOOKS_DIR, CODEX_WIN32_LAUNCHER_NAME);
+}
+
+/** @see createClaudeWin32Launcher — same pattern, Codex agent id + %* forward. */
+function createCodexWin32Launcher(): boolean {
+	const bashPath = resolveAgentShellWin32();
+	if (!/(^|[\\/])bash(\.exe)?$/i.test(bashPath)) {
+		console.warn(
+			"[agent-setup] Git Bash not found; cannot install Codex notify hook on Windows.",
+		);
+		return false;
+	}
+	const content = [
+		"@echo off",
+		"REM Superset Codex notify launcher (Windows). Runs notify.sh via Git Bash.",
+		"REM Codex passes the hook JSON payload as argv; %* forwards it to notify.sh.",
+		'set "SUPERSET_AGENT_ID=codex"',
+		`"${bashPath}" "%~dp0${NOTIFY_SCRIPT_NAME}" %*`,
+		"",
+	].join("\r\n");
+	const changed = writeFileIfChanged(
+		getCodexWin32LauncherPath(),
+		content,
+		0o755,
+	);
+	console.log(
+		`[agent-setup] ${changed ? "Updated" : "Verified"} Codex notify launcher (Windows)`,
+	);
+	return true;
+}
+
+/**
+ * The command written into Codex's ~/.codex/hooks.json. Unix inlines
+ * SUPERSET_AGENT_ID + the notify path; Windows points at the .cmd launcher
+ * (Codex appends the JSON argv when it fires the hook).
+ */
+function getCodexManagedHookCommand(): string {
+	if (process.platform === "win32") {
+		return `"${getCodexWin32LauncherPath()}"`;
+	}
+	return `SUPERSET_AGENT_ID=codex "${getNotifyScriptPath()}"`;
+}
+
 function isManagedCodexHookCommand(
 	command: string | undefined,
 	notifyScriptPath: string,
 ): boolean {
 	return (
 		command?.includes(notifyScriptPath) ||
+		(process.platform === "win32" &&
+			command?.includes(getCodexWin32LauncherPath())) ||
 		isSupersetManagedHookCommand(command, NOTIFY_SCRIPT_NAME)
 	);
 }
@@ -453,11 +504,11 @@ export function getCodexGlobalHooksJsonContent(
 		existing.hooks[eventName] = filtered;
 	}
 
-	// Inline SUPERSET_AGENT_ID like getClaudeManagedHookCommand so the v2
-	// payload carries identity even when codex is launched outside the wrapper.
-	// Quote the path: codex executes via /bin/sh -lc, so a space in $HOME
-	// (e.g. "/Users/Some User/...") would otherwise word-split.
-	const codexCommand = `SUPERSET_AGENT_ID=codex "${notifyScriptPath}"`;
+	// Inline SUPERSET_AGENT_ID so the v2 payload carries identity even when codex
+	// is launched outside the wrapper. Quote the path: codex executes via
+	// /bin/sh -lc, so a space in $HOME (e.g. "/Users/Some User/...") would
+	// otherwise word-split. On Windows this is the .cmd launcher path instead.
+	const codexCommand = getCodexManagedHookCommand();
 
 	const managedEvents: Array<{
 		eventName: "SessionStart" | "UserPromptSubmit" | "Stop";
@@ -502,6 +553,11 @@ export function getCodexGlobalHooksJsonContent(
  * lifecycle events.
  */
 export function createCodexHooksJson(): void {
+	if (process.platform === "win32") {
+		// Write the .cmd launcher (Git Bash → notify.sh, forwarding Codex's argv
+		// JSON) first; skip Codex if Git Bash isn't installed.
+		if (!createCodexWin32Launcher()) return;
+	}
 	const notifyScriptPath = getNotifyScriptPath();
 	const globalPath = getCodexGlobalHooksJsonPath();
 	const content = getCodexGlobalHooksJsonContent(notifyScriptPath);
