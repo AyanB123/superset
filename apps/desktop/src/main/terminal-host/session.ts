@@ -207,7 +207,7 @@ export class Session {
 
 		// zsh/bash/fish get shell-ready markers via our wrappers in
 		// shell-wrappers.ts. Other shells skip the gating entirely.
-		const shellName = this.shell.split("/").pop() || this.shell;
+		const shellName = path.basename(this.shell) || this.shell;
 		this.shellReadyState = SHELLS_WITH_READY_MARKER.has(shellName)
 			? "pending"
 			: "unsupported";
@@ -1001,7 +1001,7 @@ export class Session {
 		this.subprocess = null;
 		this.subprocessReady = false;
 		this.subprocessDecoder = null;
-		const shellName = this.shell.split("/").pop() || this.shell;
+		const shellName = path.basename(this.shell) || this.shell;
 		this.shellReadyState = SHELLS_WITH_READY_MARKER.has(shellName)
 			? "pending"
 			: "unsupported";

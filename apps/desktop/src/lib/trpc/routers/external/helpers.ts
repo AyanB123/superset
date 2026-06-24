@@ -83,12 +83,53 @@ const LINUX_CLI_CANDIDATES: Partial<Record<ExternalApp, string[]>> = {
 };
 
 /**
+ * Map of app IDs to their Windows launch commands.
+ *
+ * Windows editor CLIs ship as `.cmd` shims (e.g. `code.cmd`, `cursor.cmd`) or
+ * Toolbox launcher scripts. To spawn these reliably from Node without
+ * `shell: true` (the existing `spawnAsync` doesn't set it), each entry is run
+ * through `cmd /c <shim>`, which resolves `.cmd`/`.bat`/PATH-appended
+ * executables the same way a terminal would. `null` means the app has no
+ * Windows equivalent (macOS-only) or no universal command.
+ */
+const WIN32_COMMANDS: Record<ExternalApp, string | null> = {
+	finder: null, // Handled specially with shell.showItemInFolder
+	vscode: "code",
+	"vscode-insiders": "code-insiders",
+	cursor: "cursor",
+	antigravity: "antigravity",
+	devin: "devin-desktop",
+	zed: "zed",
+	xcode: null, // macOS only
+	iterm: null, // macOS only
+	warp: "warp-terminal",
+	terminal: null, // No universal Windows terminal command (wt isn't preinstalled everywhere)
+	ghostty: "ghostty",
+	sublime: "subl",
+	intellij: "idea",
+	webstorm: "webstorm",
+	pycharm: "pycharm",
+	phpstorm: "phpstorm",
+	rubymine: "rubymine",
+	goland: "goland",
+	clion: "clion",
+	rider: "rider",
+	datagrip: "datagrip",
+	appcode: null, // macOS only
+	fleet: "fleet",
+	rustrover: "rustrover",
+	"android-studio": "studio",
+};
+
+/**
  * Get candidate commands to open a path in the specified app.
  * Returns an array of commands to try in order — for multi-edition apps (IntelliJ, PyCharm),
  * multiple candidates are returned so the caller can fall back if one isn't installed.
  *
  * macOS: Uses `open -b` (bundle ID) for multi-edition apps and `open -a` (app name) for others.
  * Linux: Uses direct CLI commands (e.g. `code`, `cursor`, `zed`).
+ * Windows: Uses `cmd /c <shim>` so Node's `spawn` (no `shell: true`) can launch
+ *   the `.cmd`/Toolbox shims (e.g. `code.cmd`, `cursor.cmd`, `idea`).
  */
 export function getAppCommand(
 	app: ExternalApp,
@@ -107,6 +148,16 @@ export function getAppCommand(
 		const appName = MACOS_APP_NAMES[app];
 		if (!appName) return null;
 		return [{ command: "open", args: ["-a", appName, targetPath] }];
+	}
+
+	if (platform === "win32") {
+		const winCommand = WIN32_COMMANDS[app];
+		if (!winCommand) return null;
+		// `cmd /c <shim> <path>` lets Node's `spawn` (no `shell: true`) launch
+		// the `.cmd`/Toolbox shims; cmd resolves the shim via PATH and passes
+		// the target path through as argv. The path is a separate argv element,
+		// so a leading `/` can't be misread as a cmd switch.
+		return [{ command: "cmd", args: ["/c", winCommand, targetPath] }];
 	}
 
 	// Linux (and other non-macOS platforms)

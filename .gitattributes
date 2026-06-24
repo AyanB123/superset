@@ -1,0 +1,39 @@
+# Default: normalize text files to LF on checkout. Most of the repo is JS/TS
+# with unix-oriented tooling (bun, biome, sh scripts); LF keeps shell shebangs
+# valid on every platform including Git-Bash and WSL on Windows.
+* text=auto eol=lf
+
+# Shell scripts MUST stay LF — a CRLF shebang (#!/bin/sh\r) silently fails to
+# execute on Unix, and bash/WSL reject \r in scripts.
+*.sh text eol=lf
+
+# Windows-native batch files want CRLF — some Windows tooling expects it.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Windows installer / PowerShell scripts tolerate either, but prefer CRLF to
+# match the Windows ecosystem defaults.
+*.ps1 text eol=crlf
+
+# Binary files — never normalize.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+*.node binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.asar binary
+*.wasm binary
+*.zip binary
+*.gz binary
+*.node binary

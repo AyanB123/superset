@@ -64,13 +64,23 @@ export class Server {
 	}
 
 	async listen(): Promise<void> {
-		const dir = path.dirname(this.opts.socketPath);
-		fs.mkdirSync(dir, { recursive: true });
-		// Stale-socket cleanup: remove any prior socket file at this path.
-		try {
-			fs.unlinkSync(this.opts.socketPath);
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		// On Unix the socket is a filesystem entry: ensure its parent dir
+		// exists, clear any stale socket file at this path, then owner-only
+		// chmod it as the auth boundary. On Windows the path is a named pipe
+		// (`\\.\pipe\...`) — not a filesystem entry — so all three are no-ops;
+		// `net.createServer().listen(pipeName)` handles creation. Windows pipe
+		// security defaults to the creating process's account, which is the
+		// same owner-only intent as the 0600 chmod.
+		const isWindows = process.platform === "win32";
+		if (!isWindows) {
+			const dir = path.dirname(this.opts.socketPath);
+			fs.mkdirSync(dir, { recursive: true });
+			// Stale-socket cleanup: remove any prior socket file at this path.
+			try {
+				fs.unlinkSync(this.opts.socketPath);
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			}
 		}
 		await new Promise<void>((resolve, reject) => {
 			this.server.once("error", reject);
@@ -79,8 +89,10 @@ export class Server {
 				resolve();
 			});
 		});
-		// Owner-only access. The socket file IS the auth boundary.
-		fs.chmodSync(this.opts.socketPath, 0o600);
+		if (!isWindows) {
+			// Owner-only access. The socket file IS the auth boundary.
+			fs.chmodSync(this.opts.socketPath, 0o600);
+		}
 	}
 
 	/**
@@ -144,6 +156,17 @@ export class Server {
 	async prepareUpgrade(): Promise<
 		{ ok: true; successorPid: number } | { ok: false; reason: string }
 	> {
+		// fd-handoff is POSIX-only (tty.ReadStream / stty / negative-pgid
+		// process-group signaling; ConPTY HANDLEs aren't inheritable integer
+		// fds). The supervisor routes Windows updates to forceRestart() so this
+		// should never be reached on Windows, but a stray `prepare-upgrade`
+		// protocol message could arrive — refuse explicitly rather than crash.
+		if (process.platform === "win32") {
+			return {
+				ok: false,
+				reason: "fd-handoff seamless upgrade is not supported on Windows",
+			};
+		}
 		const liveSessions = [...this.store.all()].filter((s) => !s.exited);
 		const fdIndexBySessionId = new Map<string, number>();
 

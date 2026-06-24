@@ -28,6 +28,7 @@ function detectTarget(): string {
 	const arch = process.arch === "arm64" ? "arm64" : "x64";
 	if (process.platform === "darwin") return `darwin-${arch}`;
 	if (process.platform === "linux") return `linux-${arch}`;
+	if (process.platform === "win32") return `win32-${arch}`;
 	throw new CLIError(
 		`Unsupported platform: ${process.platform}/${process.arch}`,
 	);
@@ -193,15 +194,22 @@ export default command({
 		try {
 			await downloadAndExtract(tarballUrl(target, pinnedVersion), tempDir);
 			const newRoot = findExtractedRoot(tempDir);
-			const newBin = join(newRoot, "bin", "superset");
+			// Windows compiles to superset.exe; posix builds keep the
+			// extensionless name. Detect by target so the error stays
+			// deterministic rather than probing disk.
+			const isWin = target.startsWith("win32-");
+			const newBinName = isWin ? "superset.exe" : "superset";
+			const newBin = join(newRoot, "bin", newBinName);
 			if (!existsSync(newBin)) {
 				throw new CLIError(
-					`Extracted archive missing bin/superset (expected at ${newBin})`,
+					`Extracted archive missing bin/${newBinName} (expected at ${newBin})`,
 				);
 			}
-			chmodSync(newBin, 0o755);
-			const newHostBin = join(newRoot, "bin", "superset-host");
-			if (existsSync(newHostBin)) chmodSync(newHostBin, 0o755);
+			if (!isWin) chmodSync(newBin, 0o755);
+			// superset-host is a .cmd on win32 (chmod is a no-op there).
+			const newHostBinName = isWin ? "superset-host.cmd" : "superset-host";
+			const newHostBin = join(newRoot, "bin", newHostBinName);
+			if (!isWin && existsSync(newHostBin)) chmodSync(newHostBin, 0o755);
 
 			atomicReplace(installRoot, newRoot);
 

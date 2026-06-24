@@ -463,6 +463,13 @@ When you need to ask the user ANY question — including simple yes/no, confirma
 		this.ensureGlobalAgentInstructions();
 		await this.runtimeResolver.prepareRuntimeEnv();
 
+		// TODO(windows): thread an explicit shell into the agent's command
+		// execution. `getAgentShell()` (@superset/shared/agent-shell) resolves
+		// Git Bash → pwsh → cmd on win32, but createMastraCode()'s public
+		// options (code.mastra.ai/reference) do not expose a shell/
+		// commandExecutor/bashTool knob — its built-in Shell tool picks the
+		// system shell internally. Revisit once mastracode ships a shell
+		// override option or the Shell tool is exposed via extraTools.
 		const runtime = await createMastraCode({
 			cwd,
 			disableMcp: true,

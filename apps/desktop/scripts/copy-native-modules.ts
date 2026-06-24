@@ -13,7 +13,6 @@
  * This is safe because bun install will recreate the symlinks on next install.
  */
 
-import { execSync } from "node:child_process";
 import {
 	cpSync,
 	existsSync,
@@ -23,8 +22,10 @@ import {
 	readFileSync,
 	realpathSync,
 	rmSync,
+	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { satisfies } from "semver";
 import { requiredMaterializedNodeModules } from "../runtime-dependencies";
 
@@ -121,13 +122,13 @@ function readInstalledModuleVersion(modulePath: string): string | null {
 	return packageJson.version ?? null;
 }
 
-function copyExactModuleVersion(
+async function copyExactModuleVersion(
 	nodeModulesDir: string,
 	moduleName: string,
 	version: string,
 	destPath: string,
 	required: boolean,
-): boolean {
+): Promise<boolean> {
 	const bunStoreDir = getBunStoreDir(nodeModulesDir);
 	const bunStoreFolderName = findBunStoreFolderName(
 		bunStoreDir,
@@ -149,7 +150,7 @@ function copyExactModuleVersion(
 		}
 	}
 
-	if (fetchNpmPackage(moduleName, version, destPath)) {
+	if (await fetchNpmPackage(moduleName, version, destPath)) {
 		return true;
 	}
 
@@ -163,13 +164,13 @@ function copyExactModuleVersion(
 	return false;
 }
 
-function copyDependencyForPackage(
+async function copyDependencyForPackage(
 	nodeModulesDir: string,
 	parentModuleName: string,
 	dependencyName: string,
 	dependencyRange: string,
 	required: boolean,
-): void {
+): Promise<void> {
 	const topLevelDependencyPath = join(nodeModulesDir, dependencyName);
 	const topLevelVersion = readInstalledModuleVersion(topLevelDependencyPath);
 
@@ -182,7 +183,7 @@ function copyDependencyForPackage(
 		console.log(
 			`  ${dependencyName}: top-level version missing; materializing ${dependencyRange} at the workspace root`,
 		);
-		copyExactModuleVersion(
+		await copyExactModuleVersion(
 			nodeModulesDir,
 			dependencyName,
 			dependencyRange,
@@ -215,7 +216,7 @@ function copyDependencyForPackage(
 		`  ${dependencyName}: top-level version ${topLevelVersion ?? "missing"} does not satisfy ${dependencyRange}; materializing nested copy for ${parentModuleName}`,
 	);
 
-	copyExactModuleVersion(
+	await copyExactModuleVersion(
 		nodeModulesDir,
 		dependencyName,
 		dependencyRange,
@@ -225,14 +226,107 @@ function copyDependencyForPackage(
 }
 
 /**
+ * Extract a gzipped USTAR tarball buffer into destPath, stripping 1 leading
+ * path component (mirrors `tar xz --strip-components=1`). Self-contained so
+ * the build doesn't depend on a system shell, curl, or tar binary — it runs
+ * identically on macOS, Linux, and Windows.
+ */
+function extractTgzStripOne(buffer: Buffer, destPath: string): void {
+	const tar = gunzipSync(buffer);
+	const BLOCK = 512;
+
+	// USTAR header field offsets (bytes).
+	const NAME = 0;
+	const SIZE = 124;
+	const TYPEFLAG = 156;
+	const PREFIX = 345;
+
+	let offset = 0;
+	while (offset + BLOCK <= tar.length) {
+		const header = tar.subarray(offset, offset + BLOCK);
+		// Two consecutive zero blocks mark the end of the archive.
+		if (header.every((byte) => byte === 0)) break;
+
+		// Name: NUL-terminated at field start; size: octal, space/NUL terminated.
+		const nameEnd = header.indexOf(0, NAME);
+		const name = header
+			.subarray(NAME, nameEnd === -1 ? 100 : nameEnd)
+			.toString("utf8");
+		const prefixEnd = header.indexOf(0, PREFIX);
+		const prefix =
+			prefixEnd === -1
+				? header.subarray(PREFIX, PREFIX + 155).toString("utf8")
+				: header.subarray(PREFIX, prefixEnd).toString("utf8");
+		const rawSize = header
+			.subarray(SIZE, SIZE + 12)
+			.toString("utf8")
+			.trim();
+		const size = Number.parseInt(rawSize || "0", 8) || 0;
+		const typeflag = String.fromCharCode(header[TYPEFLAG] ?? 0);
+
+		offset += BLOCK;
+		const fileStart = offset;
+		offset += size + ((BLOCK - (size % BLOCK)) % BLOCK); // data is block-aligned
+
+		if (!name) continue;
+
+		// Strip the leading "package/" path component that npm tarballs use.
+		const entryPath = stripOneComponent(prefix ? `${prefix}/${name}` : name);
+		if (!entryPath) continue;
+
+		const fullPath = join(destPath, entryPath);
+
+		// '5' = directory entry; create it and move on.
+		if (typeflag === "5") {
+			mkdirSync(fullPath, { recursive: true });
+			continue;
+		}
+		// Normal file ('\0'/'0') and contiguous file ('7') — write the payload.
+		if (
+			typeflag === "0" ||
+			typeflag === "\0" ||
+			typeflag === "" ||
+			typeflag === "7"
+		) {
+			mkdirSync(dirname(fullPath), { recursive: true });
+			writeFileSync(fullPath, tar.subarray(fileStart, fileStart + size));
+			continue;
+		}
+		// Symlinks ('2'), hardlinks ('1'), PAX/GNU long-name headers ('L','K','x','g'),
+		// and anything else are intentionally not materialized: the native packages
+		// this fetches (ast-grep / libsql / duckdb / parcel-watcher bindings) ship
+		// self-contained .node/.dll payloads with no symlinks. A future dependency
+		// bump that DOES carry a load-bearing symlink would surface here — warn so
+		// the silent-drop failure mode stays diagnosable instead of becoming a
+		// cryptic "cannot find module" at runtime.
+		console.warn(
+			`[copy-native-modules] USTAR entry not extracted (typeflag=${JSON.stringify(typeflag)}): ${entryPath}`,
+		);
+	}
+}
+
+/**
+ * Drop the first segment of a posix/ustar path. Returns "" for single-segment
+ * paths (which have nothing left after stripping and are skipped).
+ */
+function stripOneComponent(path: string): string {
+	const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+	const slash = normalized.indexOf("/");
+	return slash === -1 ? "" : normalized.slice(slash + 1);
+}
+
+/**
  * Fetch an npm package tarball and extract it to destPath.
  * Used when cross-compiling and the target platform package isn't in the Bun store.
+ *
+ * No shell invocation: uses global fetch() + node:zlib gunzip + a self-contained
+ * USTAR reader, so it works identically on macOS, Linux, and Windows.
  */
-function fetchNpmPackage(
+async function fetchNpmPackage(
 	packageName: string,
 	version: string,
 	destPath: string,
-): boolean {
+): Promise<boolean> {
 	// npm tarball URL: @scope/pkg/-/pkg-version.tgz (filename uses pkg name without scope)
 	const barePackageName = packageName.includes("/")
 		? packageName.split("/")[1]
@@ -240,13 +334,13 @@ function fetchNpmPackage(
 	const url = `https://registry.npmjs.org/${packageName}/-/${barePackageName}-${version}.tgz`;
 	console.log(`  ${packageName}: fetching from npm (${version})`);
 	try {
+		const response = await fetch(url);
+		if (!response.ok) {
+			throw new Error(`HTTP ${response.status} ${response.statusText}`);
+		}
+		const buffer = Buffer.from(await response.arrayBuffer());
 		mkdirSync(destPath, { recursive: true });
-		execSync(
-			`curl -sL "${url}" | tar xz -C "${destPath}" --strip-components=1`,
-			{
-				stdio: "pipe",
-			},
-		);
+		extractTgzStripOne(buffer, destPath);
 		console.log(`    Extracted to: ${destPath}`);
 		return true;
 	} catch (err) {
@@ -257,7 +351,9 @@ function fetchNpmPackage(
 	}
 }
 
-function copyAstGrepPlatformPackages(nodeModulesDir: string): void {
+async function copyAstGrepPlatformPackages(
+	nodeModulesDir: string,
+): Promise<void> {
 	const astGrepNapiPath = join(nodeModulesDir, "@ast-grep", "napi");
 	if (!existsSync(astGrepNapiPath)) return;
 
@@ -324,7 +420,9 @@ function copyAstGrepPlatformPackages(nodeModulesDir: string): void {
 		// If this is the target platform package and it's not in the Bun store,
 		// fetch it from npm (cross-compilation scenario)
 		if (isTargetPkg) {
-			if (fetchNpmPackage(platformPkg.name, platformPkg.version, destPath)) {
+			if (
+				await fetchNpmPackage(platformPkg.name, platformPkg.version, destPath)
+			) {
 				resolvedTargetPackage = true;
 				continue;
 			}
@@ -343,7 +441,7 @@ function copyAstGrepPlatformPackages(nodeModulesDir: string): void {
 	}
 }
 
-function copyLibsqlDependencies(nodeModulesDir: string): void {
+async function copyLibsqlDependencies(nodeModulesDir: string): Promise<void> {
 	const libsqlPath = join(nodeModulesDir, "libsql");
 	const libsqlPkgJsonPath = join(libsqlPath, "package.json");
 	if (!existsSync(libsqlPkgJsonPath)) return;
@@ -360,7 +458,13 @@ function copyLibsqlDependencies(nodeModulesDir: string): void {
 
 	console.log("\nPreparing libsql runtime dependencies...");
 	for (const [dep, version] of Object.entries(deps)) {
-		copyDependencyForPackage(nodeModulesDir, "libsql", dep, version, true);
+		await copyDependencyForPackage(
+			nodeModulesDir,
+			"libsql",
+			dep,
+			version,
+			true,
+		);
 	}
 
 	// Copy whichever optional native platform packages Bun installed for this platform.
@@ -395,7 +499,7 @@ function copyLibsqlDependencies(nodeModulesDir: string): void {
 	for (const [name, version] of targetLibsqlPkgs) {
 		const destPath = join(nodeModulesDir, name);
 		if (!existsSync(destPath)) {
-			fetchNpmPackage(name, version, destPath);
+			await fetchNpmPackage(name, version, destPath);
 		}
 	}
 }
@@ -470,7 +574,9 @@ function copyParcelWatcherPlatformPackages(nodeModulesDir: string): void {
 	}
 }
 
-function copyDuckdbPlatformPackages(nodeModulesDir: string): void {
+async function copyDuckdbPlatformPackages(
+	nodeModulesDir: string,
+): Promise<void> {
 	const nodeBindingsPath = join(nodeModulesDir, "@duckdb", "node-bindings");
 	const nodeBindingsPkgJsonPath = join(nodeBindingsPath, "package.json");
 	if (!existsSync(nodeBindingsPkgJsonPath)) return;
@@ -505,7 +611,7 @@ function copyDuckdbPlatformPackages(nodeModulesDir: string): void {
 		return;
 	}
 
-	copyExactModuleVersion(
+	await copyExactModuleVersion(
 		nodeModulesDir,
 		targetName,
 		targetVersion,
@@ -514,7 +620,7 @@ function copyDuckdbPlatformPackages(nodeModulesDir: string): void {
 	);
 }
 
-function prepareNativeModules() {
+async function prepareNativeModules() {
 	console.log("Preparing external runtime modules for electron-builder...");
 	console.log(
 		`  Target: ${TARGET_PLATFORM}/${TARGET_ARCH} (host: ${process.platform}/${process.arch})`,
@@ -529,12 +635,12 @@ function prepareNativeModules() {
 	}
 
 	console.log("\nPreparing ast-grep platform package...");
-	copyAstGrepPlatformPackages(nodeModulesDir);
+	await copyAstGrepPlatformPackages(nodeModulesDir);
 	copyParcelWatcherPlatformPackages(nodeModulesDir);
-	copyLibsqlDependencies(nodeModulesDir);
-	copyDuckdbPlatformPackages(nodeModulesDir);
+	await copyLibsqlDependencies(nodeModulesDir);
+	await copyDuckdbPlatformPackages(nodeModulesDir);
 
 	console.log("\nDone!");
 }
 
-prepareNativeModules();
+await prepareNativeModules();

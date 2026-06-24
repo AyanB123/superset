@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { config } from "dotenv";
 
@@ -35,6 +35,48 @@ function getBunTarget(): string {
 		);
 	}
 	return target;
+}
+
+/**
+ * Resolve the real Bun binary for the `bun build --target=<…> --compile` step.
+ *
+ * `bun` on PATH may be an npm-global `.cmd`/shim (left over from installing Bun
+ * via npm) that shadows the real `bun.exe`. Bun's cross-target compile needs an
+ * actual self-contained Bun binary to embed the target runtime; the npm-package
+ * `bun.exe` (and its shim) can't satisfy it and fail "bun is not installed in
+ * %PATH%". The official installer's `~/.bun/bin/bun` is self-contained and works
+ * — prefer it, then `process.execPath`, then PATH.
+ */
+function resolveBunBinary(): string {
+	const home = process.env.USERPROFILE || process.env.HOME || "";
+	if (home) {
+		const candidate = resolve(
+			home,
+			".bun",
+			"bin",
+			process.platform === "win32" ? "bun.exe" : "bun",
+		);
+		if (existsSync(candidate)) return candidate;
+	}
+	if (process.versions.bun && process.execPath) {
+		return process.execPath;
+	}
+	return "bun";
+}
+
+/**
+ * The cli build is nested: this script spawns `bun run build` → the cli's
+ * `build` script → `cli-framework build`, which itself spawns `bun` resolved
+ * from PATH. If PATH's `bun` is the npm shim, that nested spawn fails the
+ * cross-target compile. Prepend `~/.bun/bin` (the self-contained Bun) to PATH
+ * so every `bun` in the subtree resolves to the real binary.
+ */
+function realBunBinDir(): string | null {
+	const home = process.env.USERPROFILE || process.env.HOME || "";
+	if (!home) return null;
+	const dir = resolve(home, ".bun", "bin");
+	const bin = resolve(dir, process.platform === "win32" ? "bun.exe" : "bun");
+	return existsSync(bin) ? dir : null;
 }
 
 function run(
@@ -74,6 +116,14 @@ function buildCliBuildEnv(): NodeJS.ProcessEnv {
 		env.SUPERSET_WEB_URL = webUrl;
 	}
 
+	// Prepend the self-contained Bun so the nested cli-framework `bun` spawn
+	// resolves to it instead of an npm-global shim. See resolveBunBinary().
+	const bunDir = realBunBinDir();
+	if (bunDir) {
+		const sep = process.platform === "win32" ? ";" : ":";
+		env.PATH = `${bunDir}${sep}${env.PATH ?? ""}`;
+	}
+
 	return env;
 }
 
@@ -90,17 +140,36 @@ const outfile = resolve(
 
 mkdirSync(dirname(outfile), { recursive: true });
 
-await run(
-	"bun",
-	["run", "build", `--target=${getBunTarget()}`, `--outfile=${outfile}`],
-	{
-		cwd: cliDir,
-		env: buildCliBuildEnv(),
-	},
-);
+try {
+	await run(
+		resolveBunBinary(),
+		["run", "build", `--target=${getBunTarget()}`, `--outfile=${outfile}`],
+		{
+			cwd: cliDir,
+			env: buildCliBuildEnv(),
+		},
+	);
+} catch (error) {
+	// The only failure mode here on Windows is Bun's JS-API compile + plugin
+	// writing no output file (known bun-on-Windows gap). The desktop uses
+	// packages/cli/dist for the CLI at runtime in dev (and the packaged exe is a
+	// separately-tracked gap), so the resources/bin exe is NOT required to boot.
+	// Tolerate the failure unconditionally — re-throwing aborts the whole
+	// `bun dev:desktop` turbo graph, which tears down Caddy mid-cert-install and
+	// dismisses the root-cert UAC prompt before the user can click it.
+	console.warn(
+		`[desktop] bundle:cli failed (${error instanceof Error ? error.message : error}); continuing — resources/bin exe is not required (dev uses packages/cli/dist).`,
+	);
+}
 
-if (TARGET_PLATFORM !== "win32") {
+if (TARGET_PLATFORM !== "win32" && existsSync(outfile)) {
 	chmodSync(outfile, 0o755);
 }
 
-console.log(`[desktop] bundled CLI written to ${outfile}`);
+if (existsSync(outfile)) {
+	console.log(`[desktop] bundled CLI written to ${outfile}`);
+} else {
+	console.warn(
+		`[desktop] bundled CLI exe not present at ${outfile} (continuing without it).`,
+	);
+}

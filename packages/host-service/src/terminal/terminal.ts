@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { NodeWebSocket } from "@hono/node-ws";
 import {
@@ -1018,7 +1018,7 @@ export async function createTerminalSessionInternal({
 	// Determine shell readiness support. Adopted sessions are already past
 	// shell startup, so treat them as immediately ready — the OSC 133;A
 	// marker has already flown by and we don't want to gate writes on it.
-	const shellName = shell.split("/").pop() || shell;
+	const shellName = basename(shell) || shell;
 	const shellSupportsReady =
 		!isAdopted && SHELLS_WITH_READY_MARKER.has(shellName);
 

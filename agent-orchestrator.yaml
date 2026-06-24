@@ -1,0 +1,21 @@
+runtime: process
+agent: claude-code
+workspace: worktree
+tracker:
+  plugin: github
+scm:
+  plugin: github
+reactions: {}
+agentRules: |-
+  Always run tests before pushing.
+  Use conventional commits (feat:, fix:, chore:, docs:, refactor:, test:).
+  Link issue numbers in commit messages.
+  Write clear commit messages that explain WHY, not just WHAT.
+
+  Use modern JavaScript (ES6+).
+  Prefer const over let, never use var.
+  Use async/await over raw Promises.
+  Use template literals for string interpolation.
+
+  Before pushing, run these commands:
+  - npm run lint

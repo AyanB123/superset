@@ -36,9 +36,55 @@ export function signalProcessTreeAndGroups(
 	signal: NodeJS.Signals,
 	options: SignalProcessTreeAndGroupsOptions = {},
 ): ProcessSignalTarget[] {
+	// Windows has no process groups and no `ps`; the whole-tree semantics the
+	// Unix path builds (enumerate via `ps`, signal each pid + each pgid) have
+	// no native analog. `taskkill /T /F` force-kills the root and its entire
+	// descendant tree in one kernel call, which is both simpler and the only
+	// correct action. SIGTERM/SIGKILL distinction collapses to TerminateProcess
+	// on Windows anyway, so there's nothing left to escalate — return no
+	// targets (the escalation timers in the callers then no-op).
+	if (process.platform === "win32") {
+		signalProcessTreeWindows(rootPid, options.onSignalError);
+		return [];
+	}
+
 	const targets = collectProcessSignalTargets(rootPid, options);
 	signalProcessTargets(targets, signal, options.onSignalError);
 	return targets;
+}
+
+/**
+ * Windows: `taskkill /PID <pid> /T /F` terminates the process tree rooted at
+ * `rootPid`. `/T` walks descendants, `/F` forces. Unlike the Unix path there
+ * is no graceful-then-force escalation — TerminateProcess is unconditional —
+ * so a single call is the whole job.
+ */
+function signalProcessTreeWindows(
+	rootPid: number,
+	onSignalError?: (error: ProcessSignalError) => void,
+): void {
+	const result = spawnSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
+		encoding: "utf8",
+		windowsHide: true,
+	});
+	if (result.error || result.status !== 0) {
+		// 128 = "no such process" (already dead) — treat as success, like the
+		// Unix path's ESRCH swallow in Pty.ts. Any other nonzero surfaces to
+		// the caller's onSignalError for diagnostics.
+		const stderr = (result.stderr ?? "").trim();
+		const alreadyDead =
+			stderr.includes("not found") || stderr.includes("no running instance");
+		if (!alreadyDead) {
+			onSignalError?.({
+				target: "pid",
+				id: rootPid,
+				signal: "SIGKILL",
+				error:
+					result.error ??
+					new Error(`taskkill exit ${result.status}: ${stderr}`),
+			});
+		}
+	}
 }
 
 export function collectProcessSignalTargets(
