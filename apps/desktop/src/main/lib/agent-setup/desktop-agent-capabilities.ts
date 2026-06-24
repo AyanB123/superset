@@ -34,6 +34,15 @@ export type DesktopAgentSetupAction =
 interface DesktopAgentSetupTarget {
 	id: AgentType;
 	setupActions: readonly DesktopAgentSetupAction[];
+	/**
+	 * Actions to run on Windows. Omit (or empty) for agents whose hooks aren't
+	 * ported yet — {@link setupAgentHooks} skips them on win32. The Unix
+	 * `setupActions` (bash wrappers, zsh/bash RC integration) don't apply on
+	 * Windows; instead each ported agent installs a Windows-compatible hook
+	 * (e.g. Claude merges into ~/.claude/settings.json pointing at a .cmd
+	 * launcher that runs notify.sh via Git Bash).
+	 */
+	windowsSetupActions?: readonly DesktopAgentSetupAction[];
 	managedBinary?: boolean;
 }
 
@@ -42,7 +51,7 @@ export const DESKTOP_AGENT_SETUP_BOOTSTRAP_ACTIONS = [
 	"notify-script",
 ] as const satisfies readonly DesktopAgentSetupAction[];
 
-export const DESKTOP_AGENT_SETUP_TARGETS = [
+export const DESKTOP_AGENT_SETUP_TARGETS: readonly DesktopAgentSetupTarget[] = [
 	{
 		id: "amp",
 		setupActions: ["amp-plugin", "amp-wrapper"],
@@ -51,6 +60,11 @@ export const DESKTOP_AGENT_SETUP_TARGETS = [
 	{
 		id: "claude",
 		setupActions: ["claude-settings-json", "claude-wrapper"],
+		// Windows: hooks live in ~/.claude/settings.json (no bash wrapper needed
+		// for the primary path — Claude inherits SUPERSET_* env from the Superset
+		// terminal). createClaudeSettingsJson writes a claude-notify.cmd launcher
+		// (Git Bash → notify.sh) + points the hook at it.
+		windowsSetupActions: ["claude-settings-json"],
 		managedBinary: true,
 	},
 	{
@@ -99,19 +113,25 @@ export const DESKTOP_AGENT_SETUP_TARGETS = [
 		setupActions: ["copilot-hook-script", "copilot-wrapper"],
 		managedBinary: true,
 	},
-] as const satisfies readonly DesktopAgentSetupTarget[];
+];
+
+// The type annotation on DESKTOP_AGENT_SETUP_TARGETS (not `as const`) widens the
+// element types so the optional windowsSetupActions is accessible on every
+// target; each setupActions tuple is still validated against
+// DesktopAgentSetupAction via the contextual type.
 
 /**
- * Agent ids whose bootstrap hooks currently work on Windows. Every entry in
- * {@link DESKTOP_AGENT_SETUP_TARGETS} ships a `#!/bin/bash` notify/hook script
- * plus a bash binary wrapper and (for managed binaries) zsh/bash PATH shell
- * integration — none of which function on Windows yet. So until the Wave 2
- * shell resolver + per-agent Windows hook specs land, this set is empty and
- * {@link setupAgentHooks} skips installation entirely on win32. Adding an id
- * here once its hooks are ported re-enables it for Windows automatically.
+ * Agent ids whose bootstrap hooks are ported to Windows — derived from each
+ * target's {@link DesktopAgentSetupTarget.windowsSetupActions}. An agent opts
+ * into Windows by listing the actions that install its Windows-compatible hook
+ * (e.g. Claude's `claude-settings-json`). {@link setupAgentHooks} runs only
+ * these agents' Windows actions on win32; unported agents are skipped.
  */
 export const WINDOWS_SUPPORTED_AGENT_SETUP_TARGET_IDS: readonly AgentType[] =
-	[];
+	DESKTOP_AGENT_SETUP_TARGETS.filter(
+		(target) =>
+			target.windowsSetupActions && target.windowsSetupActions.length > 0,
+	).map((target) => target.id);
 
 export const SUPERSET_MANAGED_BINARIES = DESKTOP_AGENT_SETUP_TARGETS.filter(
 	(target) => "managedBinary" in target && target.managedBinary,
