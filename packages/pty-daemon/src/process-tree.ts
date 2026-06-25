@@ -54,37 +54,121 @@ export function signalProcessTreeAndGroups(
 }
 
 /**
+ * Upper bound on a single `taskkill` invocation. Normal tree teardown is
+ * sub-second; anything past this means taskkill's tree-walk is hung on a
+ * stubborn descendant (e.g. an agent TUI holding the console). We'd rather
+ * kill the hung taskkill and fall back to a root-only TerminateProcess than
+ * block the daemon's cleanup path indefinitely.
+ */
+const TASKKILL_TIMEOUT_MS = 7000;
+
+/**
  * Windows: `taskkill /PID <pid> /T /F` terminates the process tree rooted at
  * `rootPid`. `/T` walks descendants, `/F` forces. Unlike the Unix path there
  * is no graceful-then-force escalation — TerminateProcess is unconditional —
  * so a single call is the whole job.
+ *
+ * Two hardening measures over the naive call:
+ *  - A `timeout` on spawnSync, so a tree-walk hung on a stubborn descendant
+ *    can't block the daemon's kill/cleanup path. When it fires, spawnSync
+ *    kills the child taskkill and sets `result.error.code === "ETIMEDOUT"`.
+ *  - A root-only fallback (`taskkill /PID <pid> /F`, no `/T`) that runs
+ *    whenever the primary tree-kill didn't cleanly succeed. It's a fast
+ *    kernel TerminateProcess on just the shell root, guaranteeing the root
+ *    dies even when the tree-walk hung — which is what stops conhost.exe
+ *    pseudo-console hosts from leaking.
  */
 function signalProcessTreeWindows(
 	rootPid: number,
 	onSignalError?: (error: ProcessSignalError) => void,
 ): void {
-	const result = spawnSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
+	const primary = spawnSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
 		encoding: "utf8",
 		windowsHide: true,
+		timeout: TASKKILL_TIMEOUT_MS,
 	});
-	if (result.error || result.status !== 0) {
-		// 128 = "no such process" (already dead) — treat as success, like the
-		// Unix path's ESRCH swallow in Pty.ts. Any other nonzero surfaces to
-		// the caller's onSignalError for diagnostics.
-		const stderr = (result.stderr ?? "").trim();
-		const alreadyDead =
-			stderr.includes("not found") || stderr.includes("no running instance");
-		if (!alreadyDead) {
-			onSignalError?.({
-				target: "pid",
-				id: rootPid,
-				signal: "SIGKILL",
-				error:
-					result.error ??
-					new Error(`taskkill exit ${result.status}: ${stderr}`),
-			});
-		}
+
+	const primaryStderr = (primary.stderr ?? "").trim();
+	const timedOut =
+		primary.error instanceof Error &&
+		(primary.error as NodeJS.ErrnoException).code === "ETIMEDOUT";
+	// taskkill prints "ERROR: ... timeout period expired" when IT gives up
+	// mid-teardown (distinct from our spawnSync timeout). That's taskkill
+	// bailing on a descendant, not a real failure — best-effort, not scary.
+	const taskkillGaveUp = primaryStderr
+		.toLowerCase()
+		.includes("timeout period expired");
+	const alreadyDead =
+		primaryStderr.includes("not found") ||
+		primaryStderr.includes("no running instance");
+	const primaryOk = primary.status === 0 || alreadyDead;
+
+	// "timeout period expired" is expected during teardown of a stubborn tree;
+	// log it but never surface it through onSignalError.
+	if (taskkillGaveUp) {
+		console.warn(
+			`[pty-daemon] taskkill tree-kill gave up on pid ${rootPid} (best-effort): ${primaryStderr}`,
+		);
 	}
+
+	if (!primaryOk && !timedOut && !taskkillGaveUp) {
+		// Genuinely unexpected failure — surface for diagnostics.
+		onSignalError?.({
+			target: "pid",
+			id: rootPid,
+			signal: "SIGKILL",
+			error:
+				primary.error ??
+				new Error(`taskkill exit ${primary.status}: ${primaryStderr}`),
+		});
+	}
+
+	// Fallback: if the tree-kill timed out, gave up, or otherwise failed to
+	// cleanly finish, force-kill JUST the root. This is a fast TerminateProcess
+	// with no descendant walk, so it can't hang. It's what actually tears down
+	// the shell root (and with it the conhost pseudo-console host) when the
+	// tree-walk got stuck on a descendant.
+	if (!primaryOk || timedOut || taskkillGaveUp) {
+		rootOnlyForceKill(rootPid, onSignalError, {
+			skipIfAlreadyDead: alreadyDead,
+		});
+	}
+}
+
+/**
+ * `taskkill /PID <pid> /F` — TerminateProcess on just the root, no `/T`
+ * tree-walk. Fast and unhangable. Best-effort: an "already dead" result here
+ * is success (the root is gone, which is all we can guarantee); anything else
+ * is surfaced so we don't silently lose the kill.
+ */
+function rootOnlyForceKill(
+	rootPid: number,
+	onSignalError?: (error: ProcessSignalError) => void,
+	opts: { skipIfAlreadyDead?: boolean } = {},
+): void {
+	const result = spawnSync("taskkill", ["/PID", String(rootPid), "/F"], {
+		encoding: "utf8",
+		windowsHide: true,
+		timeout: TASKKILL_TIMEOUT_MS,
+	});
+	if (result.status === 0) return;
+
+	const stderr = (result.stderr ?? "").trim();
+	const alreadyDead =
+		stderr.includes("not found") || stderr.includes("no running instance");
+	// If the primary already reported the root dead, an "already dead" echo
+	// here is expected and not worth logging again.
+	if (alreadyDead && opts.skipIfAlreadyDead) return;
+	if (alreadyDead) return;
+
+	onSignalError?.({
+		target: "pid",
+		id: rootPid,
+		signal: "SIGKILL",
+		error:
+			result.error ??
+			new Error(`taskkill root-only exit ${result.status}: ${stderr}`),
+	});
 }
 
 export function collectProcessSignalTargets(
