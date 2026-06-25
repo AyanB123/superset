@@ -98,6 +98,13 @@ export const DESKTOP_AGENT_SETUP_TARGETS: readonly DesktopAgentSetupTarget[] = [
 			"cursor-agent-wrapper",
 			"cursor-hooks-json",
 		],
+		// Windows: hooks live in ~/.cursor/hooks.json (the bash wrapper is
+		// skipped — Cursor inherits SUPERSET_* env from the terminal).
+		// createCursorHooksJson writes a cursor-notify.cmd launcher that runs
+		// cursor-hook.sh via Git Bash, forwarding stdin + the event-name argv
+		// (%*) and passing the auto-approve stdout JSON back to Cursor. The hook
+		// script itself is also written (the launcher execs it).
+		windowsSetupActions: ["cursor-hook-script", "cursor-hooks-json"],
 	},
 	{
 		id: "gemini",
@@ -106,6 +113,12 @@ export const DESKTOP_AGENT_SETUP_TARGETS: readonly DesktopAgentSetupTarget[] = [
 			"gemini-wrapper",
 			"gemini-settings-json",
 		],
+		// Windows: hooks live in ~/.gemini/settings.json (the bash wrapper is
+		// skipped — Gemini inherits SUPERSET_* env from the terminal).
+		// createGeminiSettingsJson writes a gemini-notify.cmd launcher that runs
+		// gemini-hook.sh via Git Bash, forwarding stdin and the required `{}`
+		// stdout JSON back to Gemini. The hook script itself is also written.
+		windowsSetupActions: ["gemini-hook-script", "gemini-settings-json"],
 		managedBinary: true,
 	},
 	{
@@ -116,6 +129,14 @@ export const DESKTOP_AGENT_SETUP_TARGETS: readonly DesktopAgentSetupTarget[] = [
 	{
 		id: "copilot",
 		setupActions: ["copilot-hook-script", "copilot-wrapper"],
+		// Windows: SKIPPED. Copilot's existing integration is project-level only
+		// — a bash wrapper that writes .github/hooks/superset-notify.json into
+		// the CWD at runtime. That wrapper can't run under cmd/PowerShell, and
+		// the per-CWD injection needs a POSIX shell. Copilot CLI does support
+		// global user-level hooks (~/.copilot/hooks/*.json) as of its Feb 2026
+		// GA, but adopting those would be a cross-platform behavior change (not
+		// a Windows-only mirror of the project-level path), so it's out of scope
+		// here. No windowsSetupActions → setupSingleAgent() skips it on win32.
 		managedBinary: true,
 	},
 ];
