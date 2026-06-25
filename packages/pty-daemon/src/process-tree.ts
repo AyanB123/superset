@@ -72,11 +72,13 @@ const TASKKILL_TIMEOUT_MS = 7000;
  *  - A `timeout` on spawnSync, so a tree-walk hung on a stubborn descendant
  *    can't block the daemon's kill/cleanup path. When it fires, spawnSync
  *    kills the child taskkill and sets `result.error.code === "ETIMEDOUT"`.
- *  - A root-only fallback (`taskkill /PID <pid> /F`, no `/T`) that runs
- *    whenever the primary tree-kill didn't cleanly succeed. It's a fast
- *    kernel TerminateProcess on just the shell root, guaranteeing the root
- *    dies even when the tree-walk hung — which is what stops conhost.exe
- *    pseudo-console hosts from leaking.
+ *  - A root-only fallback via Node's `process.kill(pid, "SIGKILL")` — libuv
+ *    maps this to a direct TerminateProcess on the shell root (no shell-out
+ *    to taskkill), run whenever the primary tree-kill didn't cleanly succeed.
+ *    It's more reliable than `taskkill /PID /F`, which has been observed to
+ *    print "timeout period expired" and leave a stuck process alive.
+ *    Guaranteeing the root dies is what stops conhost.exe pseudo-console
+ *    hosts from leaking.
  */
 function signalProcessTreeWindows(
 	rootPid: number,
@@ -124,51 +126,42 @@ function signalProcessTreeWindows(
 	}
 
 	// Fallback: if the tree-kill timed out, gave up, or otherwise failed to
-	// cleanly finish, force-kill JUST the root. This is a fast TerminateProcess
-	// with no descendant walk, so it can't hang. It's what actually tears down
-	// the shell root (and with it the conhost pseudo-console host) when the
-	// tree-walk got stuck on a descendant.
+	// cleanly finish, force-kill JUST the root via process.kill (direct
+	// TerminateProcess, no descendant walk, no shell-out to taskkill). It's
+	// what actually tears down the shell root (and with it the conhost
+	// pseudo-console host) when the tree-walk got stuck on a descendant.
 	if (!primaryOk || timedOut || taskkillGaveUp) {
-		rootOnlyForceKill(rootPid, onSignalError, {
-			skipIfAlreadyDead: alreadyDead,
-		});
+		rootOnlyForceKill(rootPid, onSignalError);
 	}
 }
 
 /**
- * `taskkill /PID <pid> /F` — TerminateProcess on just the root, no `/T`
- * tree-walk. Fast and unhangable. Best-effort: an "already dead" result here
- * is success (the root is gone, which is all we can guarantee); anything else
- * is surfaced so we don't silently lose the kill.
+ * Direct `TerminateProcess` on just the root via Node's
+ * `process.kill(rootPid, "SIGKILL")`. On Windows libuv maps SIGKILL to
+ * TerminateProcess (the same kernel path PowerShell's `Stop-Process -Force`
+ * uses) — crucially it does NOT shell out to taskkill, so it can't hang the
+ * way `taskkill /PID /F` does on a stuck process (observed: taskkill prints
+ * "timeout period expired" and leaves the process alive). No `/T` tree-walk,
+ * so descendants are orphaned — the documented trade for guaranteeing the
+ * shell root dies.
+ *
+ * `ESRCH` (no such process) means the root is already gone — treat as success.
  */
 function rootOnlyForceKill(
 	rootPid: number,
 	onSignalError?: (error: ProcessSignalError) => void,
-	opts: { skipIfAlreadyDead?: boolean } = {},
 ): void {
-	const result = spawnSync("taskkill", ["/PID", String(rootPid), "/F"], {
-		encoding: "utf8",
-		windowsHide: true,
-		timeout: TASKKILL_TIMEOUT_MS,
-	});
-	if (result.status === 0) return;
-
-	const stderr = (result.stderr ?? "").trim();
-	const alreadyDead =
-		stderr.includes("not found") || stderr.includes("no running instance");
-	// If the primary already reported the root dead, an "already dead" echo
-	// here is expected and not worth logging again.
-	if (alreadyDead && opts.skipIfAlreadyDead) return;
-	if (alreadyDead) return;
-
-	onSignalError?.({
-		target: "pid",
-		id: rootPid,
-		signal: "SIGKILL",
-		error:
-			result.error ??
-			new Error(`taskkill root-only exit ${result.status}: ${stderr}`),
-	});
+	try {
+		process.kill(rootPid, "SIGKILL");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return;
+		onSignalError?.({
+			target: "pid",
+			id: rootPid,
+			signal: "SIGKILL",
+			error,
+		});
+	}
 }
 
 export function collectProcessSignalTargets(
