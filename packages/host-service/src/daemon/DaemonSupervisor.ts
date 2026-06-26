@@ -105,12 +105,24 @@ export function shouldKillStaleDaemonForDev(
  * We put the socket in `os.tmpdir()` with a hash of the org id. Owner-only
  * file mode (0600, set by the daemon's Server.listen) is the auth boundary;
  * the directory permissions don't matter.
+ *
+ * Windows uses a named pipe (`\\.\pipe\...`) instead of a Unix-domain socket
+ * file. Node's `net` module accepts the same `{ path }` option for both, so
+ * only the path string differs. Named pipes are not filesystem entries, so
+ * the daemon's listen() guards the mkdir/unlink/chmod behind `isWindows`.
  */
 export function ptyDaemonSocketPath(organizationId: string): string {
 	const shortId = createHash("sha256")
 		.update(organizationId)
 		.digest("hex")
 		.slice(0, 12);
+	if (process.platform === "win32") {
+		// Named pipes share one global namespace (no per-user isolation without
+		// a `\\.\pipe\` prefix + ACLs), so the org-id hash stays in the name to
+		// keep per-org sockets distinct. Pipe names can't contain backslashes
+		// after the initial `\\.\pipe\`, so use a hyphen.
+		return `\\\\.\\pipe\\superset-ptyd-${shortId}`;
+	}
 	return path.join(os.tmpdir(), `superset-ptyd-${shortId}.sock`);
 }
 
@@ -257,6 +269,27 @@ export class DaemonSupervisor {
 	): Promise<
 		{ ok: true; successorPid: number } | { ok: false; reason: string }
 	> {
+		// Windows cannot do fd-handoff seamless upgrades: the mechanism reaches
+		// into node-pty's Unix-only `_fd`, wraps the inherited master fd in
+		// `tty.ReadStream` + `stty cols/rows`, and signals process groups via
+		// negative-pid `process.kill` — all POSIX-only with no Windows analog
+		// (ConPTY uses HANDLEs, not inheritable fds). Fall back to a fresh
+		// restart: live sessions are killed and respawned against the new
+		// binary. This is the same destructive path documented as the manual
+		// fallback on Unix when handoff can't preserve sessions.
+		if (process.platform === "win32") {
+			const _instance = this.instances.get(organizationId);
+			await this.forceRestart(organizationId, {
+				event: "pty_daemon_windows_update_restart",
+				props: { reason: "fd-handoff unsupported on Windows" },
+			});
+			const successor = this.instances.get(organizationId);
+			return {
+				ok: true,
+				successorPid: successor?.pid ?? 0,
+			};
+		}
+
 		const instance = this.instances.get(organizationId);
 		if (!instance) {
 			return { ok: false, reason: "no daemon running for this org" };
@@ -1129,8 +1162,14 @@ async function waitForSocket(
 	timeoutMs: number,
 ): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
+	// On Windows the "socket" is a named pipe (`\\.\pipe\...`), which is not a
+	// filesystem entry — `existsSync` is always false and gating on it would
+	// time out every spawn. Probe connectability directly instead. On Unix the
+	// filesystem-existence gate avoids hammering connect on a path the daemon
+	// hasn't created yet.
+	const isWindows = process.platform === "win32";
 	while (Date.now() < deadline) {
-		if (fs.existsSync(socketPath)) {
+		if (isWindows || fs.existsSync(socketPath)) {
 			if (await isSocketConnectable(socketPath, 200)) return true;
 		}
 		await new Promise((r) => setTimeout(r, 50));

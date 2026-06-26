@@ -14,6 +14,10 @@ interface PlaySoundCallbacks {
  *
  * On macOS, volume is controlled via afplay -v (0.0-1.0).
  * On Linux, volume is controlled via paplay --volume (0-65536), with aplay fallback.
+ * On Windows, there is no built-in CLI wav player, so a short system sound is
+ * played via PowerShell + SystemSounds instead. The `volume` argument is
+ * ignored on Windows (the system mixer controls loudness); `soundPath` is
+ * likewise ignored because SystemSounds are fixed OS assets.
  */
 export function playSoundFile(
 	soundPath: string,
@@ -30,6 +34,24 @@ export function playSoundFile(
 	if (process.platform === "darwin") {
 		return execFile("afplay", ["-v", volumeDecimal.toString(), soundPath], () =>
 			callbacks?.onComplete?.(),
+		);
+	}
+
+	if (process.platform === "win32") {
+		// No bundled CLI wav player on Windows; play a short system sound via
+		// PowerShell. SystemSounds.Play() is non-blocking on the .NET side and
+		// the spawned process exits immediately, matching the fire-and-forget
+		// lifecycle of the darwin/linux branches. Volume is controlled by the
+		// OS mixer, so the `volume` argument is intentionally ignored here.
+		return execFile(
+			"powershell.exe",
+			[
+				"-NoProfile",
+				"-Command",
+				"[System.Media.SystemSounds]::Asterisk.Play()",
+			],
+			{ windowsHide: true },
+			() => callbacks?.onComplete?.(),
 		);
 	}
 

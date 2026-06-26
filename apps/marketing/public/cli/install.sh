@@ -42,7 +42,25 @@ detect_target() {
             esac
             ;;
         *)
-            error "Unsupported OS: $os (only macOS and Linux are supported)"
+            # Non-darwin/linux. Windows has its own PowerShell installer; point
+            # users there instead of a bare "Unsupported OS" dead-end. Any
+            # other OS is genuinely unsupported.
+            case "$os" in
+                MINGW*|MSYS*|CYGWIN*|*Windows*)
+                    cat >&2 <<EOF
+${RED}error:${RESET} Unsupported OS for this installer: $os.
+Windows is supported via the PowerShell installer. In PowerShell, run:
+
+    irm https://superset.sh/cli/install.ps1 | iex
+
+(Raw script: https://superset.sh/cli/install.ps1)
+EOF
+                    exit 1
+                    ;;
+                *)
+                    error "Unsupported OS: $os (only macOS, Linux, and Windows are supported)"
+                    ;;
+            esac
             ;;
     esac
 }

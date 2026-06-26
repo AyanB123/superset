@@ -202,7 +202,13 @@ export function spawn({ meta }: SpawnOptions): Pty {
 	}
 	const adapter = new NodePtyAdapter(term, meta);
 	// Validate the private-fd dependency at spawn time, not handoff time.
-	adapter.getMasterFd();
+	// node-pty's Windows (ConPTY) IPty exposes no `_fd` (it uses HANDLEs, not
+	// integer fds), so the assert is Unix-only. fd-handoff itself is gated to
+	// non-Windows in Server.prepareUpgrade, so getMasterFd() is never reached
+	// there either.
+	if (process.platform !== "win32") {
+		adapter.getMasterFd();
+	}
 	return adapter;
 }
 

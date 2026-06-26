@@ -4,11 +4,16 @@ import { promisify } from "node:util";
 
 let nativeMetrics: typeof import("@superset/macos-process-metrics") | null =
 	null;
-try {
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
-	nativeMetrics = require("@superset/macos-process-metrics");
-} catch {
-	// Native addon unavailable (non-macOS or build skipped).
+// Native macOS-only addon; skip the require entirely on other platforms.
+// The try/catch below stays as defense-in-depth in case the addon is missing
+// on a macOS machine (e.g. build skipped).
+if (process.platform === "darwin") {
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-require-imports
+		nativeMetrics = require("@superset/macos-process-metrics");
+	} catch {
+		// Native addon unavailable (build skipped on this machine).
+	}
 }
 
 const execAsync = promisify(exec);

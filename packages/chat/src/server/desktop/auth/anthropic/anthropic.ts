@@ -2,8 +2,15 @@
  * Claude Code authentication resolution.
  *
  * Reads Claude credentials from:
- * 1. Claude config file (~/.claude.json or ~/.config/claude/credentials.json)
- * 2. macOS Keychain (via security command)
+ * 1. Claude config file (~/.claude.json or ~/.config/claude/credentials.json) — cross-platform
+ * 2. macOS Keychain (via security command) — darwin only
+ * 3. Auth storage (mastracode file-backed store) — cross-platform
+ *
+ * Windows note: getCredentialsFromKeychain() returns null off-darwin, but
+ * Windows users are still covered by the config-file resolver (#1) and the
+ * file-backed auth-storage resolver (#3). Claude Code on Windows does not use
+ * Windows Credential Manager, and reading its secrets requires CredRead via
+ * PowerShell (Get-StoredCredential + marshalling), which is out of scope here.
  */
 
 import { execSync } from "node:child_process";
@@ -131,6 +138,10 @@ export function getCredentialsFromConfig(): ClaudeCredentials | null {
 }
 
 export function getCredentialsFromKeychain(): ClaudeCredentials | null {
+	// macOS-only: Claude stores keys in the Keychain via the `security` CLI.
+	// Off-darwin (Linux/Windows) this resolver is a no-op; those platforms are
+	// served by the config-file and auth-storage resolvers instead. See the file
+	// header for the Windows fallback rationale.
 	if (platform() !== "darwin") {
 		return null;
 	}

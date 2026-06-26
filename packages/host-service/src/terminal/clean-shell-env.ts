@@ -231,10 +231,37 @@ export async function getStrictShellEnvironment(): Promise<
 		return { ...cache };
 	}
 
+	// Windows has no login/non-login shell distinction: a GUI-launched process
+	// (Electron → host-service) already inherits the user's full environment
+	// from the system/user registry blocks. There's nothing for a
+	// login-shell spawn to recover, and `spawnCleanShellEnv`'s POSIX flags
+	// (`sh -i -l -c`) are meaningless to cmd/PowerShell — it would hang until
+	// the 8s timeout then fail. Short-circuit to process.env directly.
+	if (process.platform === "win32") {
+		const env = snapshotProcessEnv();
+		cache = env;
+		cacheTime = Date.now();
+		return { ...cache };
+	}
+
 	const env = await spawnCleanShellEnv();
 	cache = env;
 	cacheTime = Date.now();
 	return { ...cache };
+}
+
+/**
+ * Capture the current process environment as a string record, skipping
+ * undefined-valued entries (process.env allows undefined; a plain Record
+ * cannot). Used as the Windows shell-env snapshot — see
+ * `getStrictShellEnvironment`.
+ */
+function snapshotProcessEnv(): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	return env;
 }
 
 export function clearStrictShellEnvCache(): void {

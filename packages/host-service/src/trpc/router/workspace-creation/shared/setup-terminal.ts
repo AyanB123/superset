@@ -32,6 +32,11 @@ interface StartSetupTerminalResult {
  *      authoritative). Scripts that need the canonical `.superset/` dir read
  *      `$SUPERSET_ROOT_PATH`, injected by the v2 terminal env builder.
  *
+ *   On Windows the bash fallback is intentionally NOT used (bash is often
+ *   absent and sh scripts may not run cleanly). Instead, if the repo ships a
+ *   `.superset/setup.ps1` it is run via PowerShell; otherwise the setup step
+ *   is skipped cleanly (no terminal is created).
+ *
  * No-op when neither source resolves to anything runnable.
  */
 export async function startSetupTerminalIfPresent(
@@ -98,6 +103,17 @@ export function resolveInitialCommand(args: {
 		return commands.join(" && ");
 	}
 
+	if (process.platform === "win32") {
+		// Windows: prefer a `.ps1` setup script (bash may be unavailable and
+		// sh scripts can't be relied on). If no `.ps1` is present, skip the
+		// setup step cleanly rather than attempting to run a `.sh`.
+		const ps1Script = join(args.repoPath, ".superset", "setup.ps1");
+		if (existsSync(ps1Script)) {
+			return `powershell -NoProfile -ExecutionPolicy Bypass -File ${psQuote(ps1Script)}`;
+		}
+		return null;
+	}
+
 	const fallbackScript = join(args.repoPath, ".superset", "setup.sh");
 	if (existsSync(fallbackScript)) {
 		return `bash ${singleQuote(fallbackScript)}`;
@@ -109,4 +125,14 @@ export function resolveInitialCommand(args: {
 /** POSIX single-quote escape: safe for any path passed through a shell. */
 function singleQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * PowerShell-safe single-quote escape. PowerShell single-quoted strings treat
+ * every character literally except a single quote itself, which is doubled.
+ * Used for `-File <path>` where the path must survive the cmd → powershell
+ * handoff intact (e.g. paths with spaces).
+ */
+function psQuote(value: string): string {
+	return `'${value.replaceAll("'", "''")}'`;
 }

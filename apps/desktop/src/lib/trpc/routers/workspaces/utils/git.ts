@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
-import { mkdir, rename } from "node:fs/promises";
+import { mkdir, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { BranchPrefixMode } from "@superset/local-db";
@@ -784,26 +784,40 @@ export async function removeWorktree(
 		});
 
 		// Delete the moved directory in the background — don't block the caller.
-		// Use spawned `rm -rf` instead of Node's fs.rm which can hang on macOS
-		// when encountering .app bundles with extended attributes.
-		const child = spawn("/bin/rm", ["-rf", tempPath], {
-			detached: true,
-			stdio: "ignore",
-		});
-		child.unref();
-		child.on("error", (err) => {
-			console.error(
-				`[removeWorktree] Failed to spawn rm for ${tempPath}:`,
-				err.message,
-			);
-		});
-		child.on("exit", (code: number | null) => {
-			if (code !== 0) {
+		// On macOS we spawn `/bin/rm -rf` instead of Node's fs.rm because fs.rm
+		// can hang on `.app` bundles that carry extended attributes. On other
+		// platforms (Linux, Windows) Node's fs.rm is reliable, so we use it and
+		// avoid the Unix-only `/bin/rm` spawn (which does not exist on Windows).
+		if (process.platform === "darwin") {
+			const child = spawn("/bin/rm", ["-rf", tempPath], {
+				detached: true,
+				stdio: "ignore",
+			});
+			child.unref();
+			child.on("error", (err) => {
 				console.error(
-					`[removeWorktree] Background cleanup of ${tempPath} failed (exit ${code})`,
+					`[removeWorktree] Failed to spawn rm for ${tempPath}:`,
+					err.message,
 				);
-			}
-		});
+			});
+			child.on("exit", (code: number | null) => {
+				if (code !== 0) {
+					console.error(
+						`[removeWorktree] Background cleanup of ${tempPath} failed (exit ${code})`,
+					);
+				}
+			});
+		} else {
+			// Fire-and-forget: unhandled-promise rejection is swallowed via .catch
+			// so a background rm failure never surfaces to the caller (mirrors the
+			// detached-spawn behavior on macOS, which logs but does not throw).
+			rm(tempPath, { recursive: true, force: true }).catch((err) => {
+				console.error(
+					`[removeWorktree] Background cleanup of ${tempPath} failed:`,
+					err instanceof Error ? err.message : String(err),
+				);
+			});
+		}
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		// If the worktree directory is already gone, just prune metadata

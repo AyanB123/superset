@@ -56,13 +56,21 @@ const DESKTOP_AGENT_SETUP_RUNNERS: Record<DesktopAgentSetupAction, () => void> =
 		"copilot-wrapper": createCopilotWrapper,
 	};
 
-export function setupDesktopAgentCapabilities(): void {
+export function setupDesktopAgentCapabilities(opts?: {
+	windowsOnly?: boolean;
+}): void {
 	for (const action of DESKTOP_AGENT_SETUP_BOOTSTRAP_ACTIONS) {
 		DESKTOP_AGENT_SETUP_RUNNERS[action]();
 	}
 
 	for (const target of DESKTOP_AGENT_SETUP_TARGETS) {
-		for (const action of target.setupActions) {
+		// On Windows only run the agent's ported windowsSetupActions; on Unix run
+		// the full setupActions. Agents without windowsSetupActions are skipped.
+		const actions = opts?.windowsOnly
+			? target.windowsSetupActions
+			: target.setupActions;
+		if (!actions) continue;
+		for (const action of actions) {
 			DESKTOP_AGENT_SETUP_RUNNERS[action]();
 		}
 	}
@@ -71,15 +79,30 @@ export function setupDesktopAgentCapabilities(): void {
 /**
  * Re-run setupActions for one agent. Bootstrap actions run first because
  * per-agent hooks reference the shared notify script — without them the
- * per-agent setup isn't self-sufficient. Returns `false` for unknown ids.
+ * per-agent setup isn't self-sufficient. Returns `false` for unknown ids, and
+ * on win32 for agents without ported `windowsSetupActions`. Callers (the
+ * settings UI "Add agent" safety net) treat `false` as "did not run", so no
+ * half-installed hooks are left behind.
  */
 export function setupSingleAgent(agentId: string): boolean {
 	const target = DESKTOP_AGENT_SETUP_TARGETS.find((t) => t.id === agentId);
 	if (!target) return false;
+	const windowsOnly = process.platform === "win32";
+	const actions = windowsOnly
+		? target.windowsSetupActions
+		: target.setupActions;
+	if (!actions || actions.length === 0) {
+		if (windowsOnly) {
+			console.log(
+				`[agent-setup] Agent "${agentId}" hooks are not yet supported on Windows; skipping.`,
+			);
+		}
+		return false;
+	}
 	for (const action of DESKTOP_AGENT_SETUP_BOOTSTRAP_ACTIONS) {
 		DESKTOP_AGENT_SETUP_RUNNERS[action]();
 	}
-	for (const action of target.setupActions) {
+	for (const action of actions) {
 		DESKTOP_AGENT_SETUP_RUNNERS[action]();
 	}
 	return true;

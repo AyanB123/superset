@@ -82,6 +82,16 @@ export function buildCopilotWrapperExecLine(): string {
 	const hooksJson = getCopilotHooksJsonContent(hookScriptPath);
 	const escapedJson = hooksJson.replace(/'/g, "'\\''");
 
+	// NOTE: this wrapper is Unix-only — it's a bash script that injects a
+	// project-level .github/hooks/superset-notify.json into the CWD at runtime.
+	// Copilot CLI's hook mechanism on Windows can't be mirrored the same way:
+	// (1) the bash wrapper doesn't run under cmd/PowerShell, and (2) per-CWD
+	// injection needs a POSIX shell. Copilot CLI does support global user-level
+	// hooks (~/.copilot/hooks/*.json) as of its Feb 2026 GA, but adopting those
+	// would be a cross-platform behavior change (not a Windows-only mirror of
+	// the existing project-level path) and is out of scope for this port. See
+	// desktop-agent-capabilities.ts — copilot has NO windowsSetupActions, so
+	// setupSingleAgent() skips it cleanly on win32.
 	return `# Copilot CLI only supports project-level hooks (.github/hooks/*.json in CWD).
 # Auto-inject Superset notification hooks when running inside a v2 Superset terminal.
 if [ -n "$SUPERSET_TERMINAL_ID" ] && [ -f "${hookScriptPath}" ]; then

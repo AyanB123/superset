@@ -4,7 +4,7 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "dotenv -e ../../.env -- sh -c 'exec wrangler dev --port ${WRANGLER_PORT:-8787}'",
+		"dev": "bun run dev.ts",
 		"deploy": "wrangler deploy",
 		"typecheck": "tsc --noEmit --emitDeclarationOnly false"
 	},

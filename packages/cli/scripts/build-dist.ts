@@ -34,13 +34,19 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-type Target = "darwin-arm64" | "darwin-x64" | "linux-x64" | "linux-arm64";
+type Target =
+	| "darwin-arm64"
+	| "darwin-x64"
+	| "linux-x64"
+	| "linux-arm64"
+	| "win32-x64";
 
 const VALID_TARGETS: Target[] = [
 	"darwin-arm64",
 	"darwin-x64",
 	"linux-x64",
 	"linux-arm64",
+	"win32-x64",
 ];
 const NODE_VERSION = "22.13.0";
 
@@ -94,6 +100,19 @@ const TARGET_NATIVE_PACKAGES: Record<Target, string[]> = {
 		"@anush008/tokenizers-linux-arm64-gnu",
 		"@duckdb/node-bindings-linux-arm64",
 	],
+	"win32-x64": [
+		// libsql ships its native binding under a win32-msvc build (MSVC ABI).
+		"@libsql/win32-x64-msvc",
+		"@parcel/watcher-win32-x64",
+		// tokenizers has no win32 prebuild; @anush008/tokenizers-win32-x64-msvc
+		// is the msvc-flavoured build when present.
+		"@anush008/tokenizers-win32-x64-msvc",
+		"@duckdb/node-bindings-win32-x64",
+		// node-pty and better-sqlite3 publish win32 prebuilds under their own
+		// packages — no separate per-arch sibling like the *nix targets use.
+		// Their prebuilds/win32-x64/ trees are copied as part of the parent
+		// package via RUNTIME_PACKAGES.
+	],
 };
 
 /**
@@ -129,8 +148,15 @@ function nodeArchiveName(target: Target): string {
 	return `node-v${NODE_VERSION}-${platform}-${arch}`;
 }
 
+function nodeArchiveExtension(target: Target): ".tar.gz" | ".zip" {
+	// Node distributes Windows builds as .zip; everything else as .tar.gz.
+	return targetParts(target).platform === "win32" ? ".zip" : ".tar.gz";
+}
+
 function nodeDownloadUrl(target: Target): string {
-	return `https://nodejs.org/dist/v${NODE_VERSION}/${nodeArchiveName(target)}.tar.gz`;
+	return `https://nodejs.org/dist/v${NODE_VERSION}/${nodeArchiveName(
+		target,
+	)}${nodeArchiveExtension(target)}`;
 }
 
 async function exec(cmd: string, args: string[], cwd?: string): Promise<void> {
@@ -184,7 +210,8 @@ async function downloadAndExtractNode(
 	if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true });
 
 	const archiveName = nodeArchiveName(target);
-	const archivePath = join(cacheDir, `${archiveName}.tar.gz`);
+	const extension = nodeArchiveExtension(target);
+	const archivePath = join(cacheDir, `${archiveName}${extension}`);
 	const extractedPath = join(cacheDir, archiveName);
 
 	if (!existsSync(archivePath)) {
@@ -194,13 +221,31 @@ async function downloadAndExtractNode(
 
 	if (!existsSync(extractedPath)) {
 		console.log(`[build-dist] extracting Node.js for ${target}`);
-		await exec("tar", ["-xzf", archivePath, "-C", cacheDir]);
+		if (extension === ".zip") {
+			// bsdtar (macOS/BSD) and the Win10+ system tar both handle .zip
+			// transparently via `tar -xf`. Avoid the -z flag, which only
+			// applies to gzip streams.
+			await exec("tar", ["-xf", archivePath, "-C", cacheDir]);
+		} else {
+			await exec("tar", ["-xzf", archivePath, "-C", cacheDir]);
+		}
 	}
 
-	const sourceBinary = join(extractedPath, "bin", "node");
-	const destBinary = join(destDir, "node");
+	const { platform } = targetParts(target);
+	// Node tarballs place the binary at bin/node; Windows zips place node.exe
+	// at the archive root.
+	const sourceBinary =
+		platform === "win32"
+			? join(extractedPath, "node.exe")
+			: join(extractedPath, "bin", "node");
+	const destBinaryName = platform === "win32" ? "node.exe" : "node";
+	const destBinary = join(destDir, destBinaryName);
 	cpSync(sourceBinary, destBinary);
-	chmodSync(destBinary, 0o755);
+	if (platform !== "win32") {
+		// chmod is a no-op on win32 and Node's fs.chmodSync there only affects
+		// the read-only attribute; skip it to avoid surprising side effects.
+		chmodSync(destBinary, 0o755);
+	}
 	return destBinary;
 }
 
@@ -415,7 +460,29 @@ async function buildPtyDaemon(): Promise<string> {
 	return join(ptyDaemonDir, "dist", "pty-daemon.js");
 }
 
-function writeHostWrapper(binDir: string): void {
+function writeHostWrapper(binDir: string, target: Target): void {
+	const { platform } = targetParts(target);
+	if (platform === "win32") {
+		// %~dp0 expands to the directory of this .cmd (with trailing backslash).
+		// We invoke the bundled node.exe on host-service.js, mirroring the posix
+		// wrapper's ../lib/node + ../lib/host-service.js layout. NODE_PATH is set
+		// so the bundled host-service resolves its native-addon peers from
+		// ../lib/node_modules rather than the user's global store.
+		// Lines are built with explicit \r\n so the .cmd always has CRLF
+		// regardless of how this source file's line endings are normalized.
+		const lines = [
+			"@echo off",
+			'set "NODE_PATH=%~dp0..\\lib\\node_modules"',
+			'"%~dp0..\\lib\\node.exe" "%~dp0..\\lib\\host-service.js" %*',
+			"",
+		];
+		const wrapper = `${lines.join("\r\n")}`;
+		const wrapperPath = join(binDir, "superset-host.cmd");
+		writeFileSync(wrapperPath, wrapper);
+		// No chmod on win32; .cmd files are executable by the shell association.
+		return;
+	}
+
 	const wrapper = `#!/bin/sh
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export NODE_PATH="$SCRIPT_DIR/../lib/node_modules"
@@ -440,7 +507,11 @@ async function main(): Promise<void> {
 	console.log(`[build-dist] staging: ${stagingRoot}`);
 
 	console.log("[build-dist] building CLI binary");
-	await buildCli(target, join(stagingRoot, "bin", "superset"));
+	// Windows needs the .exe extension for the shell to execute the compiled
+	// binary and for desktop's bundled-cli resolver (superset.exe) to find it.
+	const cliBinaryName =
+		targetParts(target).platform === "win32" ? "superset.exe" : "superset";
+	await buildCli(target, join(stagingRoot, "bin", cliBinaryName));
 
 	console.log("[build-dist] building host-service bundle");
 	const hostServiceBundle = await buildHostService();
@@ -470,7 +541,7 @@ async function main(): Promise<void> {
 	});
 
 	console.log("[build-dist] writing host wrapper");
-	writeHostWrapper(join(stagingRoot, "bin"));
+	writeHostWrapper(join(stagingRoot, "bin"), target);
 
 	const tarball = join(cliDir, "dist", `superset-${target}.tar.gz`);
 	console.log(`[build-dist] creating ${tarball}`);

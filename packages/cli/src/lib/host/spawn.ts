@@ -76,7 +76,13 @@ async function pollHealth(port: number, secret: string): Promise<boolean> {
 function resolveHostBinary(): string {
 	if (process.env.SUPERSET_HOST_BIN) return process.env.SUPERSET_HOST_BIN;
 	const cliBin = process.execPath;
-	return join(dirname(cliBin), "superset-host");
+	// Windows ships a `superset-host.cmd` shim (build-dist emits a batch file
+	// rather than a #!/bin/sh wrapper). Node's child_process.spawn resolves
+	// .cmd via the shell only when shell:true, so callers that use the
+	// resolved path directly still need the extension to be present on disk.
+	const wrapperName =
+		process.platform === "win32" ? "superset-host.cmd" : "superset-host";
+	return join(dirname(cliBin), wrapperName);
 }
 
 function resolveMigrationsFolder(): string {
@@ -107,6 +113,10 @@ export async function spawnHostService(
 	const child = spawn(hostBin, [], {
 		stdio: options.daemon ? "ignore" : "inherit",
 		detached: options.daemon,
+		// On Windows the host binary is a .cmd shim, which Node can only
+		// launch through cmd.exe. shell:true lets spawn find and exec it.
+		// Posix builds run the shebang directly and are unaffected.
+		shell: process.platform === "win32",
 		env: {
 			...process.env,
 			ORGANIZATION_ID: options.organizationId,

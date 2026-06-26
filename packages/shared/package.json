@@ -131,6 +131,10 @@
 		"./rrule": {
 			"types": "./src/rrule.ts",
 			"default": "./src/rrule.ts"
+		},
+		"./agent-shell": {
+			"types": "./src/agent-shell.ts",
+			"default": "./src/agent-shell.ts"
 		}
 	},
 	"scripts": {

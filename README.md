@@ -73,7 +73,7 @@ If it runs in a terminal, it runs on Superset
 
 | Requirement | Details |
 |:------------|:--------|
-| **OS** | macOS (Windows/Linux untested) |
+| **OS** | macOS (primary). **Windows is supported in beta** — see the [Windows setup guide](./apps/desktop/docs/windows-setup.md). Linux is community/untested. |
 | **Runtime** | [Bun](https://bun.sh/) v1.0+ |
 | **Version Control** | Git 2.20+ |
 | **GitHub CLI** | [gh](https://cli.github.com/) |
@@ -83,7 +83,7 @@ If it runs in a terminal, it runs on Superset
 
 **[Download Superset for macOS](https://github.com/superset-sh/superset/releases/latest)**
 
-Builds for Windows and Linux are not yet available.
+Builds for Linux are not yet available. **Windows is supported in beta** — to run from source, follow the [Windows setup guide](./apps/desktop/docs/windows-setup.md) (requires Visual Studio Build Tools 2022 for the `node-pty` compile step).
 
 ## Development
 

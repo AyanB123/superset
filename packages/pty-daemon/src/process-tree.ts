@@ -36,9 +36,132 @@ export function signalProcessTreeAndGroups(
 	signal: NodeJS.Signals,
 	options: SignalProcessTreeAndGroupsOptions = {},
 ): ProcessSignalTarget[] {
+	// Windows has no process groups and no `ps`; the whole-tree semantics the
+	// Unix path builds (enumerate via `ps`, signal each pid + each pgid) have
+	// no native analog. `taskkill /T /F` force-kills the root and its entire
+	// descendant tree in one kernel call, which is both simpler and the only
+	// correct action. SIGTERM/SIGKILL distinction collapses to TerminateProcess
+	// on Windows anyway, so there's nothing left to escalate — return no
+	// targets (the escalation timers in the callers then no-op).
+	if (process.platform === "win32") {
+		signalProcessTreeWindows(rootPid, options.onSignalError);
+		return [];
+	}
+
 	const targets = collectProcessSignalTargets(rootPid, options);
 	signalProcessTargets(targets, signal, options.onSignalError);
 	return targets;
+}
+
+/**
+ * Upper bound on a single `taskkill` invocation. Normal tree teardown is
+ * sub-second; anything past this means taskkill's tree-walk is hung on a
+ * stubborn descendant (e.g. an agent TUI holding the console). We'd rather
+ * kill the hung taskkill and fall back to a root-only TerminateProcess than
+ * block the daemon's cleanup path indefinitely.
+ */
+const TASKKILL_TIMEOUT_MS = 7000;
+
+/**
+ * Windows: `taskkill /PID <pid> /T /F` terminates the process tree rooted at
+ * `rootPid`. `/T` walks descendants, `/F` forces. Unlike the Unix path there
+ * is no graceful-then-force escalation — TerminateProcess is unconditional —
+ * so a single call is the whole job.
+ *
+ * Two hardening measures over the naive call:
+ *  - A `timeout` on spawnSync, so a tree-walk hung on a stubborn descendant
+ *    can't block the daemon's kill/cleanup path. When it fires, spawnSync
+ *    kills the child taskkill and sets `result.error.code === "ETIMEDOUT"`.
+ *  - A root-only fallback via Node's `process.kill(pid, "SIGKILL")` — libuv
+ *    maps this to a direct TerminateProcess on the shell root (no shell-out
+ *    to taskkill), run whenever the primary tree-kill didn't cleanly succeed.
+ *    It's more reliable than `taskkill /PID /F`, which has been observed to
+ *    print "timeout period expired" and leave a stuck process alive.
+ *    Guaranteeing the root dies is what stops conhost.exe pseudo-console
+ *    hosts from leaking.
+ */
+function signalProcessTreeWindows(
+	rootPid: number,
+	onSignalError?: (error: ProcessSignalError) => void,
+): void {
+	const primary = spawnSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
+		encoding: "utf8",
+		windowsHide: true,
+		timeout: TASKKILL_TIMEOUT_MS,
+	});
+
+	const primaryStderr = (primary.stderr ?? "").trim();
+	const timedOut =
+		primary.error instanceof Error &&
+		(primary.error as NodeJS.ErrnoException).code === "ETIMEDOUT";
+	// taskkill prints "ERROR: ... timeout period expired" when IT gives up
+	// mid-teardown (distinct from our spawnSync timeout). That's taskkill
+	// bailing on a descendant, not a real failure — best-effort, not scary.
+	const taskkillGaveUp = primaryStderr
+		.toLowerCase()
+		.includes("timeout period expired");
+	const alreadyDead =
+		primaryStderr.includes("not found") ||
+		primaryStderr.includes("no running instance");
+	const primaryOk = primary.status === 0 || alreadyDead;
+
+	// "timeout period expired" is expected during teardown of a stubborn tree;
+	// log it but never surface it through onSignalError.
+	if (taskkillGaveUp) {
+		console.warn(
+			`[pty-daemon] taskkill tree-kill gave up on pid ${rootPid} (best-effort): ${primaryStderr}`,
+		);
+	}
+
+	if (!primaryOk && !timedOut && !taskkillGaveUp) {
+		// Genuinely unexpected failure — surface for diagnostics.
+		onSignalError?.({
+			target: "pid",
+			id: rootPid,
+			signal: "SIGKILL",
+			error:
+				primary.error ??
+				new Error(`taskkill exit ${primary.status}: ${primaryStderr}`),
+		});
+	}
+
+	// Fallback: if the tree-kill timed out, gave up, or otherwise failed to
+	// cleanly finish, force-kill JUST the root via process.kill (direct
+	// TerminateProcess, no descendant walk, no shell-out to taskkill). It's
+	// what actually tears down the shell root (and with it the conhost
+	// pseudo-console host) when the tree-walk got stuck on a descendant.
+	if (!primaryOk || timedOut || taskkillGaveUp) {
+		rootOnlyForceKill(rootPid, onSignalError);
+	}
+}
+
+/**
+ * Direct `TerminateProcess` on just the root via Node's
+ * `process.kill(rootPid, "SIGKILL")`. On Windows libuv maps SIGKILL to
+ * TerminateProcess (the same kernel path PowerShell's `Stop-Process -Force`
+ * uses) — crucially it does NOT shell out to taskkill, so it can't hang the
+ * way `taskkill /PID /F` does on a stuck process (observed: taskkill prints
+ * "timeout period expired" and leaves the process alive). No `/T` tree-walk,
+ * so descendants are orphaned — the documented trade for guaranteeing the
+ * shell root dies.
+ *
+ * `ESRCH` (no such process) means the root is already gone — treat as success.
+ */
+function rootOnlyForceKill(
+	rootPid: number,
+	onSignalError?: (error: ProcessSignalError) => void,
+): void {
+	try {
+		process.kill(rootPid, "SIGKILL");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code === "ESRCH") return;
+		onSignalError?.({
+			target: "pid",
+			id: rootPid,
+			signal: "SIGKILL",
+			error,
+		});
+	}
 }
 
 export function collectProcessSignalTargets(
